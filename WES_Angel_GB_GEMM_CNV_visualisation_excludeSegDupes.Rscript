@@ -1,0 +1,393 @@
+#!/bin/R-3.5.1
+
+# WES_Angel_GB_GEMM_CNV_visualisation_excludeSegDupes.Rscript
+#
+# 20200105 - original script
+# 20200125 - new version to viz CNVkit outputs, having blacklisted segmental duplications (see ipynb)
+#		just change working dir to this new run's output dirs
+# Mike
+#
+###############
+# WHAT THIS DOES: 
+###############
+#
+#   takes the CNVkit results for the WES data in the GBM/tNSCs, and makes nice Circos plots
+#
+###############
+# INPUTS, OUTPUTS, ETC.
+###############
+#
+# project dir: /icgc/dkfzlsdf/analysis/B060/fletcher/RNAseq_Angel_GB_GEMMs/
+#
+# input per-sample CNVkit .cns files in ./analysis/WES_CNVkit_ourNormals/
+#		produced by WES_Angel_GB_GEMM_CNV_calling_CNVkit.sh
+#
+# script results and outputs in same dir
+#
+###############
+# CLUSTER JOB INFO
+###############
+#
+# b06x-cnt2: screen name cnv
+# request interactive job - qsub -I -l walltime=24:00:00,mem=8g,nodes=1
+# load R 3.5.1 - module load R-bundle/20180702-foss-2017a-R-3.5.1
+#
+###############
+# START CODE
+###############
+# SETUP: libraries, etc.
+###############
+# for loading tabular data and not manking it up
+options(stringsAsFactors=F)
+
+# load libs
+#library(DNAcopy)
+suppressMessages(library(circlize)) # to make circos plots
+suppressMessages(library(ComplexHeatmap)) # for legends!
+suppressMessages(library(zoo)) # for rollarray to do the CN smoothing
+suppressMessages(library(rtracklayer))
+
+# set working dir: use CNVkit with our normals analysis dir
+setwd("/icgc/dkfzlsdf/analysis/B060/fletcher/RNAseq_Angel_GB_GEMMs/analysis/CNVkit_WES_ourNormals_blacklistSegDup/")
+
+############
+# colour scale for points: map to log2 value
+############
+# define colour function for the segments: map colours to gain/loss
+# use darker/lighter shades of blue/red
+#
+breaks.y <- c(-0.585, 0, 0.585)
+# map colours
+col_fun <- colorRamp2( breaks.y, c("dodgerblue4","black","firebrick3") )
+# create legend also:
+legend.log2 <- Legend(at = breaks.y, col_fun = col_fun, 
+    title_position = "topleft", title = "log2")
+
+# y-axis values to plot lines for (plot y=0 separately)
+lines.y <- c(-2, -1, 1, 2)
+
+# legend for the synteny regions:
+# as mapped chrX/Y to numeric values 23/24, do that
+# define colour palette using http://vrl.cs.brown.edu/color
+cols.synteny <- c("#4f8c9d", "#9ae790", "#b643cd", "#48a421", "#a21636", "#09f54c", "#ff4d82", "#41d8f4", "#0b5313", "#daa7e7", "#473c85", "#9dea19", "#4220f0", "#e1d774", "#6c3640", "#ffa270", "#2c4a5e", "#d0d5de", "#738c4e", "#447cfe", "#4e4809", "#fd5917", "#a0580f", "#fa1bfc")
+# as mapped chrX/Y to numeric values 23/24, do that; use 4 columns
+legend.syn <- Legend(at = paste0("chr", c(1:22, "X","Y")), type = "grid", 
+    legend_gp = gpar(fill = cols.synteny), title_position = "topleft", ncol=4,
+    title = "Human Synteny")
+
+# manually set location of legends: x/y coords. top left corner
+legend.syn$framevp$x <- unit(.1, 'npc')
+legend.syn$framevp$y <- unit(.92, 'npc')
+legend.log2$framevp$x <- unit(.05, 'npc')
+legend.log2$framevp$y <- unit(.8, 'npc')
+
+############
+# load data
+############
+# load genomic data: CNVkit calls for the tNSC line
+# as per book: need first 3 cols in BED-like format (chrom, start, end); then can specify columns to plot, cool
+# store as a list
+list.tnsc <- list(
+  tNSC1=read.table(file="0148_004_CE_DIS_1GD1_EL1_S15_L001.sorted.mdup.call.cns", header=T, sep="\t", quote="" ),
+  tNSC2=read.table(file="0148_005_CE_DIS_1GD1_EL1_S16_L001.sorted.mdup.call.cns", header=T, sep="\t", quote="" ),
+  tNSC3=read.table(file="0148_006_CE_DIS_1GD1_EL1_S17_L001.sorted.mdup.call.cns", header=T, sep="\t", quote="" ),
+  tNSC4=read.table(file="0148_007_CE_DIS_1GD1_EL1_S3_L001.sorted.mdup.call.cns", header=T, sep="\t", quote="" )
+)
+# need to add "chr" to the "chromosome" (1st) columns, to match the UCSC names
+list.tnsc$tNSC1$chromosome <- paste0("chr",list.tnsc$tNSC1$chromosome)
+list.tnsc$tNSC2$chromosome <- paste0("chr",list.tnsc$tNSC2$chromosome)
+list.tnsc$tNSC3$chromosome <- paste0("chr",list.tnsc$tNSC3$chromosome)
+list.tnsc$tNSC4$chromosome <- paste0("chr",list.tnsc$tNSC4$chromosome)
+
+# for GBMs:
+list.gbm <- list(
+  GBM_1=read.table(file="0148_010_CE_DIS_1GD1_EL1_S20_L001.sorted.mdup.call.cns", header=T, sep="\t", quote="" ),
+  GBM_2=read.table(file="0148_011_CE_DIS_1GD1_EL1_S2_L001.sorted.mdup.call.cns", header=T, sep="\t", quote="" ),
+  GBM_3=read.table(file="0148_012_CE_DIS_1GD1_EL1_S21_L001.sorted.mdup.call.cns", header=T, sep="\t", quote="" )
+)
+# need to add "chr" to the "chromosome" (1st) columns, to match the UCSC names
+list.gbm$GBM_1$chromosome <- paste0("chr",list.gbm$GBM_1$chromosome)
+list.gbm$GBM_2$chromosome <- paste0("chr",list.gbm$GBM_2$chromosome)
+list.gbm$GBM_3$chromosome <- paste0("chr",list.gbm$GBM_3$chromosome)
+
+############
+# read in synteny table
+############
+synteny <- read.csv("../../annotation/MouseMineSynteny.csv")
+
+# remove leading 'chr' from the human synteny column:
+synteny$human_syntenic_chr <- gsub(pattern="chr", replacement="", x=synteny$human_syntenic_chr)
+
+# now also map sex chroms to numeric values
+# X = 23, Y = 24
+synteny$human_syntenic_chr[ synteny$human_syntenic_chr=="X" ] <- 23
+synteny$human_syntenic_chr[ synteny$human_syntenic_chr=="Y" ] <- 24
+
+# coerce to numeric:
+synteny$human_syntenic_chr <- as.numeric(synteny$human_syntenic_chr)
+
+############
+# set the max values for y to the ylims
+#
+# need to do this manually cos can't figure out how to get the circos funs to do it properly, as yet...
+#
+# 20200103 try using -2,2 with the new normal refs
+############
+# define y lims to plot in the Circos: use -2, +2
+lims.y <- c(-2,2)
+
+list.tnsc <- lapply( list.tnsc, function(list) {
+    list[ (list[,"log2"] < lims.y[1]), "log2" ] <- lims.y[1]
+    list[ (list[,"log2"] > lims.y[2]), "log2" ] <- lims.y[2]    
+    return(list)
+})
+
+list.gbm <- lapply( list.gbm, function(list) {
+    list[ (list[,"log2"] < lims.y[1]), "log2" ] <- lims.y[1]
+    list[ (list[,"log2"] > lims.y[2]), "log2" ] <- lims.y[2]    
+    return(list)
+})
+
+###################
+# prepare CN segmentation calls
+###################
+# so here: need to transform the integer CN calls into the logscale:
+###################
+# do this by taking log2 of (CN state/2):
+list.gbm$GBM_1$cn <- log2(list.gbm$GBM_1$cn/2)
+list.gbm$GBM_2$cn <- log2(list.gbm$GBM_2$cn/2)
+list.gbm$GBM_3$cn <- log2(list.gbm$GBM_3$cn/2)
+
+list.tnsc$tNSC1$cn <- log2(list.tnsc$tNSC1$cn/2)
+list.tnsc$tNSC2$cn <- log2(list.tnsc$tNSC2$cn/2)
+list.tnsc$tNSC3$cn <- log2(list.tnsc$tNSC3$cn/2)
+list.tnsc$tNSC4$cn <- log2(list.tnsc$tNSC4$cn/2)
+
+# remove outlier values outside the ylims:
+#
+# set any -Inf calls (i.e. log2(0) i.e. double-copy loss) to the minimum value of y lims:
+list.gbm$GBM_1$cn[list.gbm$GBM_1$cn==-Inf] <- lims.y[1]
+list.gbm$GBM_2$cn[list.gbm$GBM_2$cn==-Inf] <- lims.y[1]
+list.gbm$GBM_3$cn[list.gbm$GBM_3$cn==-Inf] <- lims.y[1]
+list.tnsc$tNSC1$cn[list.tnsc$tNSC1$cn==-Inf] <- lims.y[1]
+list.tnsc$tNSC2$cn[list.tnsc$tNSC2$cn==-Inf] <- lims.y[1]
+list.tnsc$tNSC3$cn[list.tnsc$tNSC3$cn==-Inf] <- lims.y[1]
+list.tnsc$tNSC4$cn[list.tnsc$tNSC4$cn==-Inf] <- lims.y[1]
+# and set any CN states >ymax calls to the maximum value of y lims:
+list.gbm$GBM_1$cn[list.gbm$GBM_1$cn >=lims.y[2] ] <- lims.y[2]
+list.gbm$GBM_2$cn[list.gbm$GBM_2$cn >=lims.y[2] ] <- lims.y[2]
+list.gbm$GBM_3$cn[list.gbm$GBM_3$cn >=lims.y[2] ] <- lims.y[2]
+list.tnsc$tNSC1$cn[list.tnsc$tNSC1$cn >=lims.y[2] ] <- lims.y[2]
+list.tnsc$tNSC2$cn[list.tnsc$tNSC2$cn >=lims.y[2] ] <- lims.y[2]
+list.tnsc$tNSC3$cn[list.tnsc$tNSC3$cn >=lims.y[2] ] <- lims.y[2]
+list.tnsc$tNSC4$cn[list.tnsc$tNSC4$cn >=lims.y[2] ] <- lims.y[2]
+
+# try smoothing these categorical CN states;
+# as per https://stackoverflow.com/questions/44269489/smooth-a-sequence-of-categorical-data-in-r
+#
+# use moving window width of 150 up/down bins; also do for partial windows (i.e. start/end)
+# add 1 to include the bin being smoothed
+cn.width <- 301
+# returns a character vector so coerce to numeric again
+list.gbm$GBM_1$cn <- as.numeric(zoo::rollapply(data=list.gbm$GBM_1$cn, width=cn.width, partial=TRUE,
+                                               function(x) names(which.max(table(x)))))
+list.gbm$GBM_2$cn <- as.numeric(zoo::rollapply(data=list.gbm$GBM_2$cn, width=cn.width, partial=TRUE,
+                                               function(x) names(which.max(table(x)))))
+list.gbm$GBM_3$cn <- as.numeric(zoo::rollapply(data=list.gbm$GBM_3$cn, width=cn.width, partial=TRUE,
+                                               function(x) names(which.max(table(x)))))
+list.tnsc$tNSC1$cn <- as.numeric(zoo::rollapply(data=list.tnsc$tNSC1$cn, width=cn.width, partial=TRUE,
+                                               function(x) names(which.max(table(x)))))
+list.tnsc$tNSC2$cn <- as.numeric(zoo::rollapply(data=list.tnsc$tNSC2$cn, width=cn.width, partial=TRUE,
+                                               function(x) names(which.max(table(x)))))
+list.tnsc$tNSC3$cn <- as.numeric(zoo::rollapply(data=list.tnsc$tNSC3$cn, width=cn.width, partial=TRUE,
+                                               function(x) names(which.max(table(x)))))
+list.tnsc$tNSC4$cn <- as.numeric(zoo::rollapply(data=list.tnsc$tNSC4$cn, width=cn.width, partial=TRUE,
+                                               function(x) names(which.max(table(x)))))
+
+###################
+# NEW NEW 20200126 
+#
+# remove the segdupe regions from these plotted regions
+###################
+# load the SegDupe region bedfile, with the leading 'chr' in chrom names (matches the loaded CNVkit data)
+path.bed.segdupe <- "/icgc/dkfzlsdf/analysis/B060/fletcher/RNAseq_Angel_GB_GEMMs/annotation/mm10_SegDups_ucsc20200125.bed"
+segdupe <- rtracklayer::import(con=path.bed.segdupe, format="BED")
+
+# now for each CNVkit:
+# coerce the rows (= bins) to GRanges, overlap with the SegDupes, and drop any bins that overlap with the SegDupes
+list.gbm$GBM_1 <- list.gbm$GBM_1[ -unique(from(findOverlaps(query=GRanges( seqnames=list.gbm$GBM_1$chromosome, ranges=IRanges(start=list.gbm$GBM_1$start, end=list.gbm$GBM_1$end)), subject=segdupe))), ]
+list.gbm$GBM_2 <- list.gbm$GBM_2[ -unique(from(findOverlaps(query=GRanges( seqnames=list.gbm$GBM_2$chromosome, ranges=IRanges(start=list.gbm$GBM_2$start, end=list.gbm$GBM_2$end)), subject=segdupe))), ]
+list.gbm$GBM_3 <- list.gbm$GBM_3[ -unique(from(findOverlaps(query=GRanges( seqnames=list.gbm$GBM_3$chromosome, ranges=IRanges(start=list.gbm$GBM_3$start, end=list.gbm$GBM_3$end)), subject=segdupe))), ]
+list.tnsc$tNSC1 <- list.tnsc$tNSC1[ -unique(from(findOverlaps(query=GRanges( seqnames=list.tnsc$tNSC1$chromosome, ranges=IRanges(start=list.tnsc$tNSC1$start, end=list.tnsc$tNSC1$end)), subject=segdupe))), ]
+list.tnsc$tNSC2 <- list.tnsc$tNSC2[ -unique(from(findOverlaps(query=GRanges( seqnames=list.tnsc$tNSC2$chromosome, ranges=IRanges(start=list.tnsc$tNSC2$start, end=list.tnsc$tNSC2$end)), subject=segdupe))), ]
+list.tnsc$tNSC3 <- list.tnsc$tNSC3[ -unique(from(findOverlaps(query=GRanges( seqnames=list.tnsc$tNSC3$chromosome, ranges=IRanges(start=list.tnsc$tNSC3$start, end=list.tnsc$tNSC3$end)), subject=segdupe))), ]
+list.tnsc$tNSC4 <- list.tnsc$tNSC4[ -unique(from(findOverlaps(query=GRanges( seqnames=list.tnsc$tNSC4$chromosome, ranges=IRanges(start=list.tnsc$tNSC4$start, end=list.tnsc$tNSC4$end)), subject=segdupe))), ]
+
+###################
+# plot Circos for GBM samples
+###################
+#open output plotting device
+#outputname <- paste0( Sys.Date(), "_GB_GEMMs_CNVs_Circos_GBMs_DNAcopy_CBS.pdf" )
+#pdf(outputname, height=12, width=12)
+#
+# for dev: use jpg
+outputname <- paste0( Sys.Date(), "_GB_GEMMs_CNVs_Circos_GBMs_CNVkit_log2_testCN_testSynteny.jpg" )
+jpeg(outputname, height=12, width=12, unit="in", res=300)
+
+# circos gfx parameters:
+# set gap degree between sectors to allow space for y-axis labels: set to size=1 for 18 chr, then 10 for the 19th.
+# set starting degree to 80
+circos.par(gap.after = c( rep(1, times=18), 20), start.degree = 80)
+
+# initialize, use mm10 genome as we have in this analysis; plot chroms 1:19 only
+circos.initializeWithIdeogram(species = "mm10", chromosome.index=paste0("chr",1:19))
+
+# add synteny track
+# set height to v. small!
+# map the first column in the values df (= the human_syntenic_chr column) to colour
+# use colours as defined previously
+circos.genomicTrack( synteny, numeric.column=4, track.height=0.05, 
+            panel.fun = function(region, value, ...) {
+                circos.genomicRect(region, value, col=cols.synteny[ as.numeric(value[,1]) ] ) 
+        })
+
+# add these as tracks, sample-by-sample
+#
+# use same ylims as for tNSCs
+#
+# apply plotting function over sample list
+# add tracks from outside-in, so reverse order
+lapply(X=rev(1:length(list.gbm)), FUN=function(index){
+           circos.genomicTrack( list.gbm[[index]], ylim=lims.y, 
+#           circos.genomicTrack( list.gbm[[1]], ylim=lims.y, 
+                panel.fun = function(region, value, ...) {
+                    
+                    # first, add y-axis gridlines:
+                    # dotted ones for the non-zeros
+                    for(h in lines.y ) {
+                        circos.lines(CELL_META$cell.xlim, c(h, h), lty = 2, col = "#AAAAAA")
+                    }
+                    # non-dotted for zero
+                    circos.lines(CELL_META$cell.xlim, c(0, 0), lty = 1, col = "#AAAAAA")
+                    
+                    # plot CNVkit log2 ratios as points: values in 2nd column of the 'values' df
+                    # set ylims
+                    circos.genomicPoints(region, value, numeric.column=2, ylim=lims.y, 
+                    pch=20, cex=0.2, alpha=0.5, # set plot character symbol to small dot, set plot point size
+                    col = col_fun( value[ seq(from=2,to=length(value),by=4) ] ), ...)
+                
+                    # add additional orange line with smoothed CN segmentation calls: in column 3 of the values df
+                    # use line type = segment, set width slightly larger, use ylims, with orange colour.
+                    circos.genomicLines(region=region, value=value, numeric.column=3, 
+                                        type = "segment", lwd=2, ylim=lims.y, col="orange", ...)
+               
+
+                })
+        # add log2 copy ratio y-axis labels after last sector; make font size smaller
+        circos.yaxis("right", labels.cex=0.75)
+        # add CN state y-axis labels on left of the chr1 sector; change tick positions + labels, make font orange + smaller
+        circos.yaxis("left", at=c(-2, -1, 0, 0.585, 1, 2), 
+                     labels=c(0, 1, 2, 3, 4, 8), col="orange", labels.col="orange", labels.cex=0.75,
+                     sector.index="chr1")
+   })
+
+# add centre text with plotted samples' title: 
+text(0, 0, "GBMs", cex = 3)
+
+# draw legends separately:
+grid.draw(legend.syn)
+grid.draw(legend.log2)
+
+# close plotting device after
+dev.off()
+# clear circos plot
+circos.clear()
+    
+############
+# plot Circos for tNSC samples
+############
+# open output plotting device
+#outputname <- paste0( Sys.Date(), "_GB_GEMMs_CNVs_Circos_tNSCs_DNAcopy_CBS.pdf" )
+#pdf(outputname, height=12, width=12)
+# for dev: use jpg
+outputname <- paste0( Sys.Date(), "_GB_GEMMs_CNVs_Circos_tNSCs_CNVkit_log2_testCN_testSynteny.jpg" )
+jpeg(outputname, height=12, width=12, unit="in", res=300)
+#
+# circos gfx parameters:
+# set gap degree between sectors to allow space for y-axis labels: set to size=1 for 18 chr, then 10 for the 19th.
+# set starting degree to 85
+circos.par(gap.after = c( rep(1, times=18), 20), start.degree = 80)
+#
+# initialize, use mm10 genome as we have in this analysis; plot chroms 1:19 only
+circos.initializeWithIdeogram(species = "mm10", chromosome.index=paste0("chr",1:19))
+#
+# add synteny track
+# set height to v. small!
+# map the first column in the values df (= the human_syntenic_chr column) to colour
+#circos.genomicTrack( synteny, numeric.column=4, track.height=0.05, 
+#            panel.fun = function(region, value, ...) {
+#                circos.genomicRect(region, value, col=as.numeric(value[,1]) )
+#        })
+#
+# add these as tracks, sample-by-sample
+# for "numeric column" (i.e. values to viz): pass col5 = "log2" of the bin
+#
+##
+# apply function to list of input samples: reorder to start with outside -> in
+lapply(X=rev(1:length(list.tnsc)), FUN=function(index){
+          circos.genomicTrack( list.tnsc[[index]], ylim=lims.y, 
+                panel.fun = function(region, value, ...) {
+                    
+                    # first, add y-axis gridlines:
+                    # dotted ones for the non-zeros
+                    for(h in lines.y ) {
+                        circos.lines(CELL_META$cell.xlim, c(h, h), lty = 2, col = "#AAAAAA")
+                    }
+                    # non-dotted for zero
+                    circos.lines(CELL_META$cell.xlim, c(0, 0), lty = 1, col = "#AAAAAA")
+                    
+                    # plot CNVkit log2 ratios as points: values in 2nd column of the 'values' df
+                    # set ylims
+                    circos.genomicPoints(region, value, numeric.column=2, ylim=lims.y, 
+                    pch=20, cex=0.2, alpha=0.5, # set plot character symbol to small dot, set plot point size
+                    col = col_fun( value[ seq(from=2,to=length(value),by=4) ] ), ...)
+                
+                    # add additional orange line with smoothed CN segmentation calls: in column 3 of the values df
+                    # use line type = segment, set width slightly larger, use ylims, with orange colour.
+                    circos.genomicLines(region=region, value=value, numeric.column=3, 
+                                        type = "segment", lwd=2, ylim=lims.y, col="orange", ...)
+               
+
+                })
+        # add log2 copy ratio y-axis labels after last sector; make font size smaller
+        circos.yaxis("right", labels.cex=0.75)
+        # add CN state y-axis labels on left of the chr1 sector; change tick positions + labels, make font orange + smaller
+        circos.yaxis("left", at=c(-2, -1, 0, 0.585, 1, 2), 
+                     labels=c(0, 1, 2, 3, 4, 8), col="orange", labels.col="orange", labels.cex=0.75,
+                     sector.index="chr1")
+   })
+
+# add centre text with plotted samples' title: 
+text(0, 0, "tNSCs", cex = 2)
+
+# draw legends separately:
+grid.draw(legend.syn)
+grid.draw(legend.log2)
+
+# close plotting device after
+dev.off()
+# clear circos plot
+circos.clear()
+
+
+################################################
+# save copy of session info / R env
+################################################
+message( "Saving session info and copy of R environ...")
+# session info
+seshinf <- paste ( Sys.Date(), "_CNVkit_circlize_visualisation_sessionInfo.txt", sep="")
+writeLines(capture.output(sessionInfo()), seshinf)
+
+# Renv
+outputname <- paste( Sys.Date(), "_CNVkit_circlize_visualisation_end_Renv.Rdata", sep="")
+save.image(file=outputname)

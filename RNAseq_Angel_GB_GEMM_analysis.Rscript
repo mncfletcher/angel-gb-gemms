@@ -1,0 +1,1073 @@
+#!/bin/R-3.4.3
+
+# RNAseq_Angel_GB_GEMM_analysis.Rscript
+#
+# 20191230
+# Mike
+#
+###############
+# WHAT THIS DOES: 
+###############
+#
+#   takes the counts matrix for the GEMMs in this project, and does various analyses:
+#		1. limma DE analysis comparing the tNSC and GBM lines vs ctrl NSCs
+#		2. heatmap of the Wang 2017 GB subtype genes
+#		3. MDSs of the samples
+#		4. GSEA and ssGSEA of the lines/individual samples vs. the Wang 2017 subtype signatures
+#		5. show that early tumour passages are "more stem cell-like"
+#			- visualise expression of an activated NSC signature:
+#				(from Table S6 of https://www.sciencedirect.com/science/article/pii/S1934590910006399 )
+#			- plot as heatmaps (voom log-cpm, z-scores) and beeswarm/violins
+#
+###############
+# INPUTS, OUTPUTS, ETC.
+###############
+#
+# project dir: /icgc/dkfzlsdf/analysis/B060/fletcher/RNAseq_Angel_GB_GEMMs/
+#
+# input per-samples featureCounts files in ./counts/ (per-sample folders) (from the RNAseq processing .sh)
+# sample metadata in ./metadata/
+# script results and outputs in ./analysis/RNAseq_subtype_genes_signatures_analysis
+#
+# GSEA resources (i.e. GB subtype sigs) in /icgc/dkfzlsdf/analysis/hipo/hipo_016/gsea/
+#
+# the aNSC signture from Table S6 of the above paper, as a .csv (2-column: array probe IDs, gene symbols) in
+#		./annotation/aNSC_signature_Beckervordersandforth_2015_20201224.csv
+#
+###############
+# CLUSTER JOB INFO
+###############
+#
+# b06x-cnt2: screen name mouse
+# request interactive job - qsub -I -l walltime=24:00:00,mem=8g,nodes=1
+# load R 3.4.3 - module load R-bundle/20171215-foss-2017a-R-3.4.3
+#
+###############
+# START CODE
+###############
+# load libraries
+message( "\nLoading libraries...\n")
+suppressMessages( library(EnrichedHeatmap) )
+suppressMessages( library(npGSEA) )
+suppressMessages( library(limma) )
+suppressMessages( library(ReportingTools) )
+suppressMessages( library(GSEABase) )
+suppressMessages( library("AnnotationDbi") )
+suppressMessages( library("org.Hs.eg.db") )
+suppressMessages( library(org.Mm.eg.db) )
+suppressMessages( library(GSVA) ) # GSVA needed for Cahoy signatures
+suppressMessages( library(GSVAdata) ) 
+suppressMessages( library(ggplot2) )
+suppressMessages( library(estimate) )
+suppressMessages( library(clusterProfiler) )
+suppressMessages( library(edgeR) )
+
+# define colours for annotations (as named vectors)
+# sample conditions:
+cols.conditions <- c("ctrlNSC"="#000000","tNSC"="cyan","tNSC_infiltrative"="navy",
+                    "tNSC_bulky"="blue","GBM"="#4daf4a")
+# colours for 2017 subtype signatures
+cols.subtypes <- c("Classical_2017"="#984ea3", "Mesenchymal_2017"="#377eb8", "Proneural_2017"="#4daf4a")
+
+################
+# FUNCTION TO PRODUCE HTML REPORT
+#
+# from npGSEA vignette
+# produce html report using ReportingTools package
+#
+# OPTIONS:
+# gsea.input = input npGSEA object 
+# shortName = name of output HTML file
+# reportDirectory = directory for output
+# title = title for output HTML file
+# genesetcollection = GeneSetCollection obj used in npGSEA analysis
+# adjpvalthr = multiple testing adjusted pval threshold to filter results
+#
+# n.b. the annotation.db used in publish() is the same as I'm using so that's cool.
+gsea.report <- function( gsea.input, shortName, title, reportDirectory="./reports", genesetcollection ) {
+  # calculate adj pvals
+  adjpvals <- p.adjust( unlist(pTwoSided(gsea.input)), method= "BH" )
+  # generate report
+  npgseaReport <- HTMLReport(shortName = shortName, title = title, reportDirectory = reportDirectory )
+  publish(genesetcollection, npgseaReport, annotation.db = "org.Hs.eg", setStats = unlist(zStat(gsea.input)), setPValues = adjpvals)
+  finish(npgseaReport)
+}
+
+################
+#
+# RESOURCES
+#
+################
+# path to GSEA resources dir
+# for hipo016 this is /icgc/dkfzlsdf/analysis/hipo/hipo_016/gsea
+gsea.res.dir <- "/icgc/dkfzlsdf/analysis/hipo/hipo_016/gsea"
+message( paste( "Directory with GSEA resources:", gsea.res.dir ) )
+
+# set analysis dir as working dir
+analysis.dir <- "/icgc/dkfzlsdf/analysis/B060/fletcher/RNAseq_Angel_GB_GEMMs/"
+setwd(analysis.dir)
+
+# make new datestamped output directory in working dir
+# use -p option for mkdir to make any required parents
+output.dir <- paste0("-p analysis/RNAseq_subtype_genes_signatures_analysis_", Sys.Date(), "/")
+
+message( paste( "Output directory (will be created):", output.dir ) )
+
+# create output directory
+system2("mkdir", args=output.dir)
+
+# fix path for output dir: remove the -p bit
+output.dir <- gsub(pattern="-p ", replacement="", x=output.dir)
+
+# load Gencode annotation used:
+path.mouse.gencode <- "/icgc/ngs_share/assemblies/mm10/databases/gencode/gencodeM2/gencode.vM2.annotation_plain.gtf"
+gencode <- rtracklayer::import(con=path.mouse.gencode, format="GFF")
+
+# read in metadata sheet:
+metadata <- read.csv("./metadata/GB_GEMMs_RNAseq_samplesheet.csv", stringsAsFactors=F)
+
+# NEW NEW NEW 20190917: remove the tNSC_bulky samples from analysis as per Barbara
+metadata <- metadata[!grepl(pattern="_bulky_", x=metadata$Sample_ID),]
+
+################################################################
+#
+# LOAD AND PRE-PROCESS GENE EXPRESSION DATA
+#
+################################################################
+# load GX: get all featureCounts files 
+# find paths in metadata sheet
+res.fc <- metadata$path_counts
+
+# read all the featureCounts counts in as a matrix
+# each file is a tab-delim table with a # header; counts for the sample are in the 7th col
+mat.counts <- sapply( X=res.fc, function(x) read.table(file=x, sep="\t", header=T, quote="", comment.char = "#")[,7])
+
+# add colnames (sample IDs) from metadata:
+colnames(mat.counts) <- metadata$Sample_ID
+
+# add row names (ENSG IDs with gene symbols):
+# get ENSG IDs from first column of one of the counts files
+rownames(mat.counts) <- read.table(file=res.fc[1], sep="\t", header=T, quote="", comment.char = "#")[,1]
+
+###########
+#
+# FILTER OUT LOWLY-EXPRESSED TRANSCRIPTS
+#
+###########
+message( "Filtering unexpressed transcripts, plotting row counts per gene...")
+# what's the distribution of counts per gene like?
+#
+# calculate
+counts.per.gene <- rowMeans(mat.counts)
+# plot
+# set ylim
+outputname <- paste( output.dir, Sys.Date(), "_01_raw_counts_per_gene_xlim.png", sep="")
+png(outputname)
+qplot(counts.per.gene, main="Raw counts per gene (0-10000)", xlim=c(0, 10000))
+dev.off()
+
+# zoom in further at very low end...
+outputname <- paste( output.dir, Sys.Date(), "_02_raw_counts_per_gene_xlim.png", sep="")
+png(outputname)
+qplot(counts.per.gene, main="Raw counts per gene (0-100)", xlim=c(0, 100))
+dev.off()
+
+message( "... done!")
+
+message( "Setting filter for counts per gene...")
+
+#
+# SET COUNTS FILTER LEVEL
+#
+# try using the previous filter on the whole data set: >10 reads in >3 samples (20% of cohort)
+filter <- apply( mat.counts, 1, function(x) length(x[x>10])>=3)
+counts.filt <- mat.counts[ filter, ]
+
+# print # genes pre- and post-filtering
+pre.filt <- dim(counts.raw)[1]
+post.filt <- dim(counts.filt)[1]
+message( paste("Number of genes pre-filter: ", pre.filt, "; post-filter: ", post.filt, sep="") )
+#
+# leaves 18760 genes
+
+################################################################
+#
+# NEW NEW NEW 20191129: DE ANALYSIS OF LATE PASSAGES VS ctrlNSCs
+#
+# aim here: identify the KEGG pathways that are up-regulated over the timecourses.
+#
+# so here we can compare,,
+#    (i) for the GBM line: compare GBM_2 and _3 vs ctrlNSC reps 1-3
+#    (ii) for the tNSC line: compare tNSC reps 1-3 vs ctrlNSC reps 1-3
+#
+# NEW 20200116: also directly compare tumour lineages:
+#	 (iii) all GBM vs all tNSC
+#	 (iv) late GBM vs tNSC2-4
+#
+################################################################
+# set up a new design matrix 
+message( "Setting up design matrix...")
+
+# set up design matrix based on the contrasts we want:
+f <- factor(c( rep("ctrlNSC",times=3), "tNSC1", "tNSC2", "tNSC3", rep("tNSC4",times=3),
+               "GBM_1",rep("GBM_late",times=2)) )
+design <- model.matrix(~0 + f)
+colnames(design) <- levels(f)
+
+###########
+#
+# VOOM!
+#
+# Using TMM and also sample quality weights, because we have inequal library sizes - look in dge$samples
+#
+###########
+message( "Running ...")
+# now use voom to model the raw counts as normal distributions and feed into the limma analysis pipeline
+#
+# as per section 15.3 of limma user's guide
+#
+# need to create a dge object using edgeR
+#library(edgeR)
+dge <- DGEList(counts=counts.filt)
+dge <- calcNormFactors(dge)
+
+message( "Plotting voom TMM and MDS...")
+# apply voom transformation
+# open printing device for voom function's output plot
+outputname <- paste( output.dir, Sys.Date(), "_04_voom_TMM_withSampleWeights_mean_var_plot.png", sep="")
+png(outputname)
+# run voom
+voom.tmm <- voomWithQualityWeights( counts=dge, design=design, plot=T )
+dev.off()
+
+###########
+#
+# LINEAR MODELLING
+#
+###########
+message( "Fitting linear models to data...")
+# perform linear modelling...
+fit <- lmFit(voom.tmm, design)
+
+###########
+# test for DE genes
+#
+# see section 9.3 of limma user's guide for notes on design and contrast matrices.
+#
+# n.b. use "robust" eBayes fitting due to our weird outliers
+#
+# construct contrasts matrix
+# design: compare the GBM_late (n=2) and tNSC4 (n=3) groups to the ctrlNSC (n=3) group
+# NEW 20200116 also compare all GBM vs all tNSC; and late GBM vs tNSC2-4
+de.contrasts.even <- makeContrasts( tNSC4-ctrlNSC, GBM_late-ctrlNSC, 
+		(GBM_1+GBM_late)-(tNSC1+tNSC2+tNSC3+tNSC4), (GBM_late)-(tNSC2+tNSC3+tNSC4), 
+		levels=design)
+
+message( "eBayes fitting of contrasts to data...")
+
+# then fit again, using robust=T for eBayes fitting
+fit2 <- contrasts.fit(fit, de.contrasts.even)
+fit2 <- eBayes(fit2, robust=T)
+
+#
+# identify significant tests using global (ie all contrasts) BH correction 
+#
+message( "Identifying significant genes...")
+res2 <- decideTests(fit2, method="global", adjust.method="BH", p.value=0.001)
+
+############################################################
+#
+#
+# PLOT VENN DIAGRAMS COMPARING SUBTYPE DEG LISTS
+#
+#
+############################################################
+message( "Plotting Venn diagrams of DEG overlap between contrasts...")
+# plot for res2, pval < 0.001, separate multiple testing correction
+# first: total DEG
+outputname <- paste( output.dir, Sys.Date(), "_06_vennDiagram_subtype_specific_genes_pval_0.001.png", sep="")
+png(outputname, height=1024, width=1024) # 20150416 - increase res to make png nicer
+vennDiagram(res2, main="Condition-specific genes (voom+TMM+sampleweights) pval < 0.001", names=c("tNSC4 vs ctrlNSC", "GBM 1+2 vs ctrlNSC", "GBM vs tNSC", "late GBM vs late tNSC"), cex=c(1.5, 1.2, 1.2))
+dev.off()
+# second: DEG split into up/down
+outputname <- paste( output.dir, Sys.Date(), "_07_vennDiagram_subtype_specific_genes_pval_0.001_includeboth.png", sep="")
+png(outputname, height=1024, width=1024)
+vennDiagram(res2, main="Condition-specific genes (voom+TMM+sampleweights) pval < 0.001", include=c("up","down"), names=c("tNSC4 vs ctrlNSC", "GBM 1+2 vs ctrlNSC", "GBM vs tNSC", "late GBM vs late tNSC"), cex=c(1.5, 1.2, 1.2))
+dev.off()
+# polished version of analysis:
+# output as pdf
+outputname <- paste( output.dir, Sys.Date(), "_07_vennDiagram_subtype_specific_genes_pval_0.001_includeboth_Manuscript.pdf", sep="")
+pdf(outputname, height=5, width=5)
+vennDiagram( res2, 
+            main=NULL, # no title 
+            include=c("up","down"), # split DEG by dynamics 
+            names=c("tNSC4 vs ctrlNSC", "GBM 2+3 vs ctrlNSC", "GBM vs tNSC", "late GBM vs late tNSC"),  # names for contrasts
+            circle.col=cols.conditions[c("tNSC","GBM")], # colour contrasts by condition colours
+            show.include=F, # do not show total #genes in analysis
+            cex=c(0.6, 0.75, 0.75) # change text char size
+           )
+dev.off()
+
+##########################################################################################
+#
+#
+# EXTRACT CONDITION-SPECIFIC GENE LISTS FROM THIS DE ANALYSIS:
+#
+#
+##########################################################################################
+# using res2 - global hypothesis testing adjustment, FDR<0.001
+message( "Outputting global expression data...")
+# output entire MArrayLM using 'write.fit' https://stat.ethz.ch/pipermail/bioconductor/2006-January/011656.html
+outputname <- paste( output.dir, Sys.Date(), "_limmavoom_DE_analysis_FDR_0.001.txt", sep="")
+write.fit(fit2, results=res2, file=outputname, adjust="BH", method="global")
+
+# do global adj of pvals and add to output data
+#
+# take pvals adjust globally, then add back in
+#
+# from http://grokbase.com/t/r/bioconductor/127ngqhjkd/bioc-limma-how-to-obtain-p-values-using-method-global-for-multiple-testing
+Global.Adjusted.P <- fit2$p.value
+# gives a single vector of pvals: now adjust
+Global.Adjusted.P <- p.adjust(Global.Adjusted.P, method="BH")
+# this vector corresponds to #genes tested X #contrasts
+# where coef1 = first column of fit2$p.val = the first contrast - e.g. in this analysis, IDH.
+
+message( "Outputting per-condition DE lists...")
+
+############
+# tNSC4 vs ctrlNSC
+############
+# first: output full set of results, unsorted
+limma.tnsc <- topTable(fit2, coef=1, n=Inf, sort="none")
+# replace adj.P.val in this with globally adjusted pvals from above
+limma.tnsc$adj.P.Val <- Global.Adjusted.P[ 1:dim(limma.tnsc)[1] ]
+# CONVERT IDs
+# the keys in our metadata are not ENSEMBL keys - they're ENSEMBL + transcript IDs. need to convert by removing the ".N" at the end of each ID
+# first split each row.name using "." as delimiter, e.g. "ENSG00000223972.4" -> "ENSG00000223972"
+# then use sapply to extract the first member of each list; this is the ENSG* ID
+limma.tnsc$ensembl_gene <- sapply(strsplit( rownames(limma.tnsc) , "[.]"), "[", 1)
+# convert IDs
+# HGNC symbol
+limma.tnsc$hgnc_symbol <- convertIDs( limma.tnsc$ensembl_gene, "ENSEMBL", "SYMBOL", org.Mm.eg.db)
+# longer gene name
+limma.tnsc$genename <- convertIDs( limma.tnsc$ensembl_gene, "ENSEMBL", "GENENAME", org.Mm.eg.db)
+
+# output tab-delim txt
+# full list
+outputname <- paste( output.dir, Sys.Date(), "_limmavoom_DE_analysis_tNSC4_vs_ctrlNSC_DEgenes_FDR_all.txt", sep="")
+write.table(limma.tnsc, file=outputname, quote=F, sep="\t", row.names=F)
+# at adj pval 0.001
+outputname <- paste( output.dir, Sys.Date(), "_limmavoom_DE_analysis_tNSC4_vs_ctrlNSC_DEgenes_FDR_0.001.txt", sep="")
+write.table(limma.tnsc[limma.tnsc$adj.P.Val<0.001,], file=outputname, quote=F, sep="\t", row.names=F)
+
+############
+# GBM late vs ctrlNSC
+############
+# first: output full set of results, unsorted
+limma.gbm <- topTable(fit2, coef=2, n=Inf, sort="none")
+# replace adj.P.val in this with globally adjusted pvals from above
+limma.gbm$adj.P.Val <- Global.Adjusted.P[ (dim(limma.gbm)[1]+1) : (2*dim(limma.gbm)[1]) ]
+# CONVERT IDs
+# the keys in our metadata are not ENSEMBL keys - they're ENSEMBL + transcript IDs. need to convert by removing the ".N" at the end of each ID
+# first split each row.name using "." as delimiter, e.g. "ENSG00000223972.4" -> "ENSG00000223972"
+# then use sapply to extract the first member of each list; this is the ENSG* ID
+limma.gbm$ensembl_gene <- sapply(strsplit( rownames(limma.gbm) , "[.]"), "[", 1)
+# convert IDs
+# HGNC symbol
+limma.gbm$hgnc_symbol <- convertIDs( limma.gbm$ensembl_gene, "ENSEMBL", "SYMBOL", org.Mm.eg.db)
+# longer gene name
+limma.gbm$genename <- convertIDs( limma.gbm$ensembl_gene, "ENSEMBL", "GENENAME", org.Mm.eg.db)
+
+# output tab-delim txt
+# full list
+outputname <- paste( output.dir, Sys.Date(), "_limmavoom_DE_analysis_GBMlate_vs_ctrlNSC_DEgenes_FDR_all.txt", sep="")
+write.table(limma.gbm, file=outputname, quote=F, sep="\t", row.names=F)
+# at adj pval 0.001
+outputname <- paste( output.dir, Sys.Date(), "_limmavoom_DE_analysis_GBMlate_vs_ctrlNSC_DEgenes_FDR_0.001.txt", sep="")
+write.table(limma.gbm[limma.gbm$adj.P.Val<0.001,], file=outputname, quote=F, sep="\t", row.names=F)
+
+############
+# all GBM vs all tNSC
+############
+# first: output full set of results, unsorted
+limma.alltum <- topTable(fit2, coef=3, n=Inf, sort="none")
+# replace adj.P.val in this with globally adjusted pvals from above
+limma.alltum$adj.P.Val <- Global.Adjusted.P[ 1:dim(limma.alltum)[1] ]
+# CONVERT IDs
+# the keys in our metadata are not ENSEMBL keys - they're ENSEMBL + transcript IDs. need to convert by removing the ".N" at the end of each ID
+# first split each row.name using "." as delimiter, e.g. "ENSG00000223972.4" -> "ENSG00000223972"
+# then use sapply to extract the first member of each list; this is the ENSG* ID
+limma.alltum$ensembl_gene <- sapply(strsplit( rownames(limma.alltum) , "[.]"), "[", 1)
+# convert IDs
+# HGNC symbol
+limma.alltum$hgnc_symbol <- convertIDs( limma.alltum$ensembl_gene, "ENSEMBL", "SYMBOL", org.Mm.eg.db)
+# longer gene name
+limma.alltum$genename <- convertIDs( limma.alltum$ensembl_gene, "ENSEMBL", "GENENAME", org.Mm.eg.db)
+
+############
+# late GBM vs tNSC
+############
+# first: output full set of results, unsorted
+limma.latetum <- topTable(fit2, coef=3, n=Inf, sort="none")
+# replace adj.P.val in this with globally adjusted pvals from above
+limma.latetum$adj.P.Val <- Global.Adjusted.P[ 1:dim(limma.latetum)[1] ]
+# CONVERT IDs
+# the keys in our metadata are not ENSEMBL keys - they're ENSEMBL + transcript IDs. need to convert by removing the ".N" at the end of each ID
+# first split each row.name using "." as delimiter, e.g. "ENSG00000223972.4" -> "ENSG00000223972"
+# then use sapply to extract the first member of each list; this is the ENSG* ID
+limma.latetum$ensembl_gene <- sapply(strsplit( rownames(limma.latetum) , "[.]"), "[", 1)
+# convert IDs
+# HGNC symbol
+limma.latetum$hgnc_symbol <- convertIDs( limma.latetum$ensembl_gene, "ENSEMBL", "SYMBOL", org.Mm.eg.db)
+# longer gene name
+limma.latetum$genename <- convertIDs( limma.latetum$ensembl_gene, "ENSEMBL", "GENENAME", org.Mm.eg.db)
+
+
+####################################
+#
+# DO KEGG PATHWAY TESTING USING CLUSTERPROFILER!
+#
+####################################
+library(clusterProfiler)
+
+# for enrichment testing: need vector of Entrez IDs
+#
+# as we have different sample# in the contrasts
+# just take the top 500 up/down DEG by pvals (so have comparable #genes for both)
+genelist.tnsc <- limma.tnsc[order(limma.tnsc$adj.P.Val,decreasing=F),]
+genelist.tnsc.up <- convertIDs(genelist.tnsc[genelist.tnsc$logFC>0,"ensembl_gene"][1:500],
+                                "ENSEMBL","ENTREZID", org.Mm.eg.db, ifMultiple="useFirst")
+genelist.tnsc.down <- convertIDs(genelist.tnsc[genelist.tnsc$logFC<0,"ensembl_gene"][1:500],
+                                "ENSEMBL","ENTREZID", org.Mm.eg.db, ifMultiple="useFirst")
+genelist.gbm <- limma.gbm[order(limma.gbm$adj.P.Val,decreasing=F),]
+genelist.gbm.up <- convertIDs(genelist.gbm[genelist.gbm$logFC>0,"ensembl_gene"][1:500],
+                                "ENSEMBL","ENTREZID", org.Mm.eg.db, ifMultiple="useFirst")
+genelist.gbm.down <- convertIDs(genelist.gbm[genelist.gbm$logFC<0,"ensembl_gene"][1:500],
+                                "ENSEMBL","ENTREZID", org.Mm.eg.db, ifMultiple="useFirst")
+# drop NAs:
+genelist.tnsc.up <- genelist.tnsc.up[ !is.na(genelist.tnsc.up) ]
+genelist.gbm.up <- genelist.gbm.up[ !is.na(genelist.gbm.up) ]
+genelist.tnsc.down <- genelist.tnsc.down[ !is.na(genelist.tnsc.down) ]
+genelist.gbm.down <- genelist.gbm.down[ !is.na(genelist.gbm.down) ]
+# how many left in each?
+length(genelist.tnsc.up) # 496
+length(genelist.gbm.up) # 460
+length(genelist.tnsc.down) # 495
+length(genelist.gbm.down) # 494
+
+# do testing for KEGG pathways: 
+# do not adjust for multiple testing
+kegg.deg.tnsc.up <- enrichKEGG(gene=genelist.tnsc.up, organism="mmu", minGSSize=20, pAdjustMethod="none")
+kegg.deg.tnsc.down <- enrichKEGG(gene=genelist.tnsc.down, organism="mmu", minGSSize=20, pAdjustMethod="none")
+kegg.deg.gbm.up <- enrichKEGG(gene=genelist.gbm.up, organism="mmu", minGSSize=20, pAdjustMethod="none")
+kegg.deg.gbm.down <- enrichKEGG(gene=genelist.gbm.down, organism="mmu", minGSSize=20, pAdjustMethod="none")
+
+# output the results as csv:
+outputname <- paste0(output.dir, "tNSC_GBM_vs_ctrlNSC_top500_up_down_DEG_by_pval_KEGG_", Sys.Date(), ".csv")
+write.csv( do.call(rbind, list(tNSC_UP=kegg.deg.tnsc.up@result, tNSC_DOWN=kegg.deg.tnsc.down@result,
+                               GBM_UP=kegg.deg.gbm.up@result, GBM_DOWN=kegg.deg.gbm.down@result) ), 
+          outputname ) # must rbind this list of dataframes
+
+# also do for the tumour comparisons
+#
+# for enrichment testing: need vector of Entrez IDs
+#
+# as we have different sample# in the contrasts
+# just take the top 500 up/down DEG by pvals (so have comparable #genes for both)
+genelist.alltum <- limma.alltum[order(limma.alltum$adj.P.Val,decreasing=F),]
+genelist.alltum.up <- convertIDs(genelist.alltum[genelist.alltum$logFC>0,"ensembl_gene"][1:500],
+                                "ENSEMBL","ENTREZID", org.Mm.eg.db, ifMultiple="useFirst")
+genelist.alltum.down <- convertIDs(genelist.alltum[genelist.alltum$logFC<0,"ensembl_gene"][1:500],
+                                "ENSEMBL","ENTREZID", org.Mm.eg.db, ifMultiple="useFirst")
+genelist.latetum <- limma.latetum[order(limma.latetum$adj.P.Val,decreasing=F),]
+genelist.latetum.up <- convertIDs(genelist.latetum[genelist.latetum$logFC>0,"ensembl_gene"][1:500],
+                                "ENSEMBL","ENTREZID", org.Mm.eg.db, ifMultiple="useFirst")
+genelist.latetum.down <- convertIDs(genelist.latetum[genelist.latetum$logFC<0,"ensembl_gene"][1:500],
+                                "ENSEMBL","ENTREZID", org.Mm.eg.db, ifMultiple="useFirst")
+# drop NAs:
+genelist.alltum.up <- genelist.alltum.up[ !is.na(genelist.alltum.up) ]
+genelist.latetum.up <- genelist.latetum.up[ !is.na(genelist.latetum.up) ]
+genelist.alltum.down <- genelist.alltum.down[ !is.na(genelist.alltum.down) ]
+genelist.latetum.down <- genelist.latetum.down[ !is.na(genelist.latetum.down) ]
+# how many left in each?
+length(genelist.alltum.up) # 
+length(genelist.latetum.up) # 
+length(genelist.alltum.down) # 
+length(genelist.latetum.down) # 
+
+# do testing for KEGG pathways: 
+# do not adjust for multiple testing
+kegg.deg.alltum.up <- enrichKEGG(gene=genelist.alltum.up, organism="mmu", minGSSize=20, pAdjustMethod="none")
+kegg.deg.alltum.down <- enrichKEGG(gene=genelist.alltum.down, organism="mmu", minGSSize=20, pAdjustMethod="none")
+kegg.deg.latetum.up <- enrichKEGG(gene=genelist.latetum.up, organism="mmu", minGSSize=20, pAdjustMethod="none")
+kegg.deg.latetum.down <- enrichKEGG(gene=genelist.latetum.down, organism="mmu", minGSSize=20, pAdjustMethod="none")
+
+# output the results as csv:
+outputname <- paste0(output.dir, "tNSC_vs_GBM_top500_up_down_DEG_by_pval_KEGG_", Sys.Date(), ".csv")
+write.csv( do.call(rbind, list(all_samples_UP=kegg.deg.alltum.up@result, all_samples_DOWN=kegg.deg.alltum.down@result,
+                               late_samples_UP=kegg.deg.latetum.up@result, late_samples_DOWN=kegg.deg.latetum.down@result) ), 
+          outputname ) # must rbind this list of dataframes
+
+
+################################################################
+#
+# RUN npGSEA FOR GB (Wang 2017) SIGNATURES - VERSUS CELL LINE CONDITIONS (npGSEA)
+#
+################################################################
+# get df of marker genes: rbind per-subtype sigs
+#
+# for Wang 2017: extract from the .mod files in the publication package 'ssgsea.GBM.classification' (which does NOT work!)
+df.marker.genes <- rbind(
+  # CL, 2017  
+ data.frame(symbol=c('PTPRA','ELOVL2','MLC1','SOX9','ARNTL','DENND2A','BBS1','ABLIM1','PAX6','ZHX3','USP8','PLCG1','CDH4','RASGRP1','ACSBG1','CST3','BCKDHB','LHFP','VAV3','ACSL3','EYA2','SEPT11','SLC4A4','SLC20A2','C14orf159','CTNND1','ZFHX4','SPRY2','ZNF45','NCOA1','PLCE1','DTNA','POLRMT','SALL1','TYK2','TJP1','MEOX2','FGFR3','STXBP3','GRIK1','GATM','UPF1','NPEPL1','KIAA0494','RBCK1','PHKB','SLC3A2','PPARGC1A','PNPLA6','MYO5C'),
+             subtype="Classical_2017", stringsAsFactors=F),
+  # MES, 2017  
+  data.frame(symbol=c('ARPC1B','S100A11','CTSC','GLIPR1','NNMT','VDR','RGS2','CTSB','TGFBI','PLAUR','LY96','BCL3','TNFAIP8','IER3','PRSS23','IL7R','RAB27A','RUNX1','P4HA2','CYP1B1','BACE2','ACPP','FTL','SLPI','RAC2','RARRES1','SYNGR2','THBS1','IL6','CAV1','PI3','CDCP1','ITGB1','LOX','CD72','COL1A2','ANPEP','MMP7','SPAG4','BNC2','NDRG1','CNN2','LUM','PTGS2','COL3A1','COL5A1','SDC1','COL1A1','GPRC5A','COL15A1'),
+             subtype="Mesenchymal_2017", stringsAsFactors=F),
+  # PN, 2017  
+  data.frame(symbol=c('HN1','RAB33A','HDAC2','MYT1','MTSS1','HOXD3','GPR17','PTTG1','KLRC3','HRASLS','TCP1','NPPA','PFDN2','CA10','EPHB1','UGT8','PAK7','SLC1A1','NARF','DCTN3','SMPD3','ZNF804A','RASL11B','MYB','PDGFRA','ERBB3','CLGN','SOX10','BCL11A','NMU','ZNF643','CDKN1C','JPH3','PCDHA9','IL1RAPL1','MAST1','VIPR2','SIM2','BAMBI','PKMYT1','PLCB4','SLC17A6','KLRK1','CENPJ','NHLH1','GABRB3','KLRC4','KCNK3','GRID2','DACH1'),
+             subtype="Proneural_2017", stringsAsFactors=F)
+)
+
+# get homology tabel from http://www.informatics.jax.org/downloads/reports/HOM_MouseHumanSequence.rpt
+# in /icgc/dkfzlsdf/analysis/B060/fletcher/RNAseq_Angel_GB_GEMMs/annotation/
+# so read in as tab-delim txt:
+df.homologues <- read.table(file="/icgc/dkfzlsdf/analysis/B060/fletcher/RNAseq_Angel_GB_GEMMs/annotation/HOM_MouseHumanSequence.rpt",
+                           sep="\t", header=T, quote="",stringsAsFactors=F)
+
+# now: take human gene symbols, look up the "HomoloGene.ID" for each, and retrieve mouse symbols based on that:
+df.marker.genes$homologene.ids <- df.homologues$HomoloGene.ID[ match(df.marker.genes$symbol, df.homologues$Symbol)]
+# drop any NAs from here
+df.marker.genes <- df.marker.genes[ !is.na(df.marker.genes$homologene.ids ), ]
+# now add in the mouse symbols:
+df.marker.genes$mouse_symbol <- df.homologues$Symbol[df.homologues$Common.Organism.Name=="mouse, laboratory"][ match(df.marker.genes$homologene.ids, df.homologues$HomoloGene.ID[df.homologues$Common.Organism.Name=="mouse, laboratory"]) ]
+# drop further NAs from here
+df.marker.genes <- df.marker.genes[ !is.na(df.marker.genes$mouse_symbol ), ]
+# add in ENSMUSG IDs from the gencode ref
+df.marker.genes$ensmusg_id <- gencode$gene_id[ match(df.marker.genes$mouse_symbol, gencode$gene_name) ]
+# remove any NAs from THAT.
+df.marker.genes <- df.marker.genes[ !is.na(df.marker.genes$ensmusg_id ), ]
+
+dim(df.marker.genes)
+# leaves 134 genes
+
+# read in the gene signatures directly as GeneSets
+# use ENSMUSG IDs to match rownames of the voom expr matrix
+wang.classical <- GeneSet( geneIds=unique(df.marker.genes$ensmusg_id[df.marker.genes$subtype=="Classical_2017"]), setName="Wang_2017_Classical" )
+wang.mesenchymal <- GeneSet( geneIds=unique(df.marker.genes$ensmusg_id[df.marker.genes$subtype=="Mesenchymal_2017"]), setName="Wang_2017_Mesenchymal" )
+wang.proneural <- GeneSet( geneIds=unique(df.marker.genes$ensmusg_id[df.marker.genes$subtype=="Proneural_2017"]), setName="Wang_2017_Proneural" )
+# and set up as GeneSetCollection
+gb.signatures <- GeneSetCollection( c(wang.classical, wang.mesenchymal, wang.proneural) )
+
+# according to the npGSEA author (Jessica Larson - see email 20150114) should use two treatment groups to compare enrichment
+# so as the gx matrix, use the full matrix with the treatments as follows
+# subtype of interest = include
+# other subtypes = exclude
+#
+# from above: use as gx matrix full set - fix rownames so they match the IDs in the GeneSets, 
+# i.e, use symbols instead; map from Gencode ref
+#rownames(voom.tmm$E) <- gencode$gene_name[ match( rownames(voom.tmm$E), gencode$gene_id ) ]
+
+# open df for results
+gsea.res <- data.frame()
+
+# as treatments, use based on the condition defined in the metadata
+for( condition in unique(metadata$Condition) )
+	{
+		gsea <- npGSEA( x=voom.tmm$E, y=as.factor(metadata$Condition==condition), set=gb.signatures) 
+		# plot output using gsea.report function
+		# generate shortName title etc based on date
+		outputname <- paste(  "GBM_subtype_signatures_vs_", condition, "_", Sys.Date(), sep="")
+		title <- paste("npGSEA report - GSEA of GBM subtype GX signatures (Wang 2017) in ", condition, sep="")
+		gsea.report(gsea.input=gsea, shortName=outputname, title=title, genesetcollection=gb.signatures, reportDirectory=output.dir )
+        
+        # add z-scores (ie enrichment scores) to res df
+        gsea.res <- rbind( gsea.res, sapply(gsea, zStat) )
+	}	
+
+# add conditions to res df as rownames:
+rownames(gsea.res) <- unique(metadata$Condition)
+# fix colnames: order of sigs
+colnames(gsea.res) <- names(gb.signatures)
+
+################################################
+# viz as heatmap:
+################################################
+# set up annotations for rows/samples: get from metadata$Condition 
+ha.anno <- rowAnnotation(df=data.frame(Condition=metadata$Condition[match(rownames(gsea.res), metadata$Condition)]),
+                        col=list(Condition=cols.conditions))
+
+# colours for z-scale
+library(RColorBrewer)
+library(circlize)
+#cols.z <- colorRamp2( breaks=c( min(gsea.res.z), 0, max(gsea.res.z) ), colors=rev(brewer.pal(3, "PuOr")) )
+
+# raw ESs:
+# colours for ESs
+cols <- colorRamp2( breaks=c( min(gsea.res), 0, max(gsea.res) ), colors=c("blue","white","red")) 
+#
+# generate heatmap obj
+p <- Heatmap( as.matrix(gsea.res), col=cols, name="npGSEA ES", 
+             #width=unit(2, "cm"), 
+             column_names_gp = gpar(fontsize = 8),
+	clustering_method_rows="ward.D2", 
+             clustering_distance_rows=function(x) as.dist(1-cor(t(x))), 
+             row_dend_width = unit(2, "cm"), #annotation=ha.anno,
+	column_title="npGSEA Enrichment Scores", column_title_gp = gpar(fontsize = 9), 
+             show_row_names=TRUE, 
+             cluster_columns=TRUE,
+            clustering_method_columns="ward.D2", 
+             clustering_distance_columns=function(x) as.dist(1-cor(t(x))) ) + ha.anno
+pdf(paste0(output.dir, Sys.Date(),"_GB_GEMM_cell_lines_subtyping_GB_signatures_npGSEA_ES_heatmap.pdf"))
+p
+dev.off()
+
+
+################################################
+# do ssGSEA for each sample in turn:
+################################################
+########################
+# NEW NEW NEW 20190917 as per Barbara's request:
+# for next steps of ssGSEA:
+#
+# take average of the triplicates of the tNSC4_infiltrative and ctrlNSC
+########################
+# extract expression matrix, as df to make it ezier
+mat.gx.ssgsea <- as.data.frame(voom.tmm$E)
+# calculate means for replicates
+mat.gx.ssgsea$ctrlNSC <- rowMeans( mat.gx.ssgsea[ , grepl(pattern="ctrlNSC_", x=colnames(mat.gx.ssgsea)) ] )
+mat.gx.ssgsea$tNSC4 <- rowMeans( mat.gx.ssgsea[ , grepl(pattern="tNSC4_", x=colnames(mat.gx.ssgsea)) ] )
+# remove replicates
+mat.gx.ssgsea <- mat.gx.ssgsea[ , !grepl(pattern="_rep", x=colnames(mat.gx.ssgsea)) ]
+
+# use GSVA:
+# use ssgsea method; for kcdf use Gaussian as we are using log-cpms from the limma-voom analysis
+ssgsea.res <- gsva(as.matrix(mat.gx.ssgsea), gb.signatures, method="ssgsea")
+# take transverse of mat so that rows = samples
+ssgsea.res <- t(ssgsea.res)
+
+# set up annotations for rows/samples: define  based on samples
+rownames(ssgsea.res)
+#[1] "tNSC1"   "tNSC2"   "tNSC3"   "GBM_1"   "GBM_2"   "GBM_3"   "ctrlNSC"
+#[8] "tNSC4"
+ha.anno2 <- rowAnnotation(df=data.frame(Condition=c( rep("tNSC",3), rep("GBM",3), "ctrlNSC", "tNSC")),
+                        col=list(Condition=cols.conditions[c(1,2,5)]))
+
+# raw ESs:
+# colours for ESs
+cols <- colorRamp2( breaks=c( min(ssgsea.res), 0, max(ssgsea.res) ), colors=c("blue","white","red")) 
+#
+# generate heatmap obj
+p <- Heatmap( as.matrix(ssgsea.res), col=cols, name="ssGSEA ES", 
+             #width=unit(2, "cm"), 
+             column_names_gp = gpar(fontsize = 8),
+	clustering_method_rows="ward.D2", 
+             clustering_distance_rows=function(x) as.dist(1-cor(t(x))), 
+             row_dend_width = unit(2, "cm"), #annotation=ha.anno,
+	column_title="ssGSEA ESs", column_title_gp = gpar(fontsize = 9), 
+             show_row_names=TRUE, 
+             cluster_columns=TRUE,
+            clustering_method_columns="ward.D2", 
+             clustering_distance_columns=function(x) as.dist(1-cor(t(x))) ) + ha.anno2
+pdf(paste0(output.dir, Sys.Date(),"_GB_GEMM_cell_lines_subtyping_GB_signatures_ssGSEA_ES_heatmap.pdf"))
+p
+dev.off()
+
+# also do for z-scores: scale columns
+ssgsea.res.z <- scale(ssgsea.res)
+# colours for ESs
+cols.z <- colorRamp2( breaks=c( min(ssgsea.res.z), 0, max(ssgsea.res.z) ), colors=rev(brewer.pal(3, "PuOr")) )
+#
+# generate heatmap obj
+p <- Heatmap( as.matrix(ssgsea.res.z), col=cols.z, name="z-scores of\nssGSEA ES", 
+             #width=unit(2, "cm"), 
+             column_names_gp = gpar(fontsize = 8),
+	clustering_method_rows="ward.D2", 
+             clustering_distance_rows=function(x) as.dist(1-cor(t(x))), 
+             row_dend_width = unit(2, "cm"), #annotation=ha.anno,
+	column_title="z-scores of ssGSEA ESs", column_title_gp = gpar(fontsize = 9), 
+             show_row_names=TRUE, 
+             cluster_columns=TRUE,
+            clustering_method_columns="ward.D2", 
+             clustering_distance_columns=function(x) as.dist(1-cor(t(x))) ) + ha.anno2
+pdf(paste0(output.dir, Sys.Date(),"_GB_GEMM_cell_lines_subtyping_GB_signatures_ssGSEA_ES_heatmap_z-scores.pdf"))
+p
+dev.off()
+
+################################################
+#
+# directly visualise the GX of subtype marker genes: in all samples
+#
+# do for the two signatures separately (otherwise double-counting genes, plus they're SEPARATE classifications...)
+#
+################################################
+# get the expression values for these marker genes from the voom-norm expr matrix that's had replicates combined above:
+mat.marker.genes <- mat.gx.ssgsea[ match( df.marker.genes$ensmusg_id, rownames(mat.gx.ssgsea) ), ]
+# take unique rows only (as a gene may appear in 2 subtype sigs)
+mat.marker.genes <- unique(mat.marker.genes)
+# drop NAs:
+mat.marker.genes <- mat.marker.genes[!is.na(rownames(mat.marker.genes)),]
+# map mouse symbols to rownames: need to remove NAs first ffs, and also from the f'ing matrix
+new.names <- df.marker.genes$mouse_symbol[ match(rownames(mat.marker.genes), df.marker.genes$ensmusg_id) ]
+mat.marker.genes <- mat.marker.genes[!is.na(new.names),]
+new.names <- new.names[!is.na(new.names)]
+rownames(mat.marker.genes) <- new.names
+
+# how many left?
+dim(mat.marker.genes)
+# 127 rows, 8 cols
+
+################################
+# Wang 2017
+################################
+# filter df.marker.genes for 2017 only
+df.marker.genes <- df.marker.genes[grepl(pattern="_2017", x=df.marker.genes$subtype),]
+
+# subset the matrix of marker gene expr
+mat.heatmap <- as.matrix(mat.marker.genes[ rownames(mat.marker.genes) %in% 
+                                as.character(df.marker.genes$mouse_symbol[grepl(pattern="_2017", x=df.marker.genes$subtype)]), ])
+# set up vector to split heatmap: match on gene (rownames) subtype
+heatmap.split <- df.marker.genes$subtype[ match(rownames(mat.heatmap), df.marker.genes$mouse_symbol) ]
+
+# set up row (gene) annotation: based on the marker gene df; check for presence in GX mat
+row.anno <- rowAnnotation(
+    df=data.frame(gene_subtype=df.marker.genes[ match(rownames(mat.heatmap),df.marker.genes$mouse_symbol),"subtype"] ),
+    col=list(gene_subtype=cols.subtypes[grepl(pattern="_2017", x=names(cols.subtypes))]) # legend: keep 2017 only
+)
+
+# set up column(sample) annotation based on GX mat col order...
+colnames(mat.marker.genes)
+#[1] "tNSC1"   "tNSC2"   "tNSC3"   "GBM_1"   "GBM_2"   "GBM_3"   "ctrlNSC"
+#[8] "tNSC4"
+col.anno <- columnAnnotation(df=data.frame(
+			Condition=c( rep("tNSC",3), rep("GBM",3), "ctrlNSC", "tNSC")
+		), 
+		col=list(Condition=cols.conditions[c(1,2,5)]) # subset condition colours for the ones used.
+		)
+
+# now gen heatmap:
+# colour for voom-norm: use purple/orange i s'pose
+cols.gx <- colorRamp2( breaks=c( min(mat.heatmap), 1, mean(mat.heatmap), 4, max(mat.heatmap) ), colors=rev(brewer.pal(5, "PuOr")) )
+# generate heatmap obj
+p <- Heatmap( as.matrix(mat.heatmap), col=c("blue","white","red"), name="log-cpm (voom)", 
+             #width=unit(2, "cm"), 
+             split=heatmap.split, # split on gene subtype!
+             column_names_gp = gpar(fontsize = 5),
+             clustering_method_rows="complete", 
+             clustering_distance_rows=function(x) as.dist(1-cor(t(x))), 
+             row_dend_width = unit(2, "cm"), top_annotation=col.anno,
+             column_title="Wang 2017 Subtype Gene Expression", column_title_gp = gpar(fontsize = 9), 
+             show_row_names=TRUE, row_names_gp=gpar(fontsize=4),
+             cluster_columns=TRUE,
+             clustering_method_columns="complete", 
+             clustering_distance_columns=function(x) as.dist(1-cor(t(x))) ) + row.anno
+pdf(paste0(output.dir, Sys.Date(),"_GB_GEMM_cell_lines_subtyping_GB_signatures_GX_heatmap_Wang_2017.pdf"), 
+    height=12, width=6)
+p
+dev.off()
+
+# also do z-scores for the rows - so do scale on transverse of matrix, then transverse back to original shape
+mat.heatmap.z <- t(scale(t(mat.heatmap)))
+# now gen heatmap:
+# colour for z-scores
+cols.z <- colorRamp2( breaks=c( min(mat.heatmap.z), 0, max(mat.heatmap.z) ), colors=rev(brewer.pal(3, "PuOr")) )
+# generate heatmap obj
+p <- Heatmap( as.matrix(mat.heatmap.z), col=cols.z, name="z-scores of\nlog-cpm (voom)", 
+             #width=unit(2, "cm"), 
+             split=heatmap.split, # split on gene subtype!             
+             column_names_gp = gpar(fontsize = 5),
+	clustering_method_rows="ward.D2", 
+             clustering_distance_rows=function(x) as.dist(1-cor(t(x))), 
+             row_dend_width = unit(2, "cm"), top_annotation=col.anno,
+	column_title="Wang 2017 Subtype Gene Expression", column_title_gp = gpar(fontsize = 9), 
+             show_row_names=TRUE, row_names_gp=gpar(fontsize=4),
+             cluster_columns=TRUE,
+            clustering_method_columns="ward.D2", 
+             clustering_distance_columns=function(x) as.dist(1-cor(t(x))) ) + row.anno
+pdf(paste0(output.dir, Sys.Date(),"_GB_GEMM_cell_lines_subtyping_GB_signatures_GX_heatmap_Wang_2017_z-scores.pdf"), 
+    height=12, width=6)
+p
+dev.off()
+
+################################################
+# check expr of marker genes that we're really keen on:
+################################################
+goi <- c("SOX10","OLIG2","GPR17", # PN
+         "MBP","VSX1","GABRB2", # NL
+         "CEBPB","TGFBR2","ITGAM", #MES
+         "EGFR","SOX9","TEAD3") # CL
+# get those values
+mat.goi <- mat.marker.genes[ rownames(mat.marker.genes) %in% df.marker.genes$ensmusg_id[ df.marker.genes$symbol %in% goi ] , ]
+# map symbols (mouse!)
+rownames(mat.goi) <- df.marker.genes$mouse_symbol[ match(rownames(mat.goi), df.marker.genes$ensmusg_id) ]  
+
+# write various things to tables:
+outputname <- paste0(output.dir, Sys.Date(), "_GB_GEMMs_full_expression_matrix_limma-voom_log-cpm.csv")
+write.csv(x=voom.tmm$E, file=outputname)
+outputname <- paste0(output.dir, Sys.Date(), "_GB_GEMMs_subtype_marker_genes_expression_matrix_limma-voom_log-cpm.csv")
+write.csv(x=mat.marker.genes, file=outputname)
+
+
+################################################
+# do MDS on all genes and then subtype marker genes:
+################################################
+# edit functions from H016 limma analysis so it takes the colours for here
+my.mds.plot <- function (expr, samp_id, samp_type, outname, title)
+{
+    sampleDists <- dist(t(expr))
+    sampleDistMatrix <- as.matrix(sampleDists)
+    rownames(sampleDistMatrix) <- paste(samp_id, samp_type, sep = "-")
+    mds <- data.frame(cmdscale(sampleDistMatrix))
+    mds$class <- samp_type
+    png(outname)
+    print( qplot(X1, X2, color = class, data = mds, main = title) + scale_colour_manual(values = cols.conditions) + theme_bw()  )
+    dev.off()
+}
+my.labelled.mds.plot <- function (expr, samp_id, samp_type, outname, title, other_lab)
+{
+    sampleDists <- dist(t(expr))
+    sampleDistMatrix <- as.matrix(sampleDists)
+    rownames(sampleDistMatrix) <- paste(samp_id, samp_type, sep = "-")
+    mds <- data.frame(cmdscale(sampleDistMatrix))
+    mds$class <- samp_type
+    png(outname, width = 1024, height = 1024)
+    print(qplot(X1, X2, color = class, data = mds, main = title) +
+        geom_text(aes(label = other_lab), size = 8, hjust = 1,
+            vjust = 1) + scale_colour_manual(values = cols.conditions) + theme_bw() )
+    dev.off()
+}
+
+# plot for on the full matrix of all genes; without and with Sample ID as a label for each point:
+outputname <- paste( output.dir, Sys.Date(), "_GB_GEMMs_MDS_all_genes.png", sep="")
+my.mds.plot(voom.tmm$E, metadata$Sample_ID, metadata$Condition, outputname, 
+            "MDS - voom with TMM norm\nUsing all genes")
+outputname <- paste( output.dir, Sys.Date(), "_GB_GEMMs_MDS_labelled_all_genes.png", sep="")
+my.labelled.mds.plot(voom.tmm$E, metadata$Sample_ID, metadata$Condition, outputname, 
+                     "MDS - voom with TMM norm\nUsing all genes", metadata$Sample_ID)
+
+# next: get for *all* samples without averaging triplicates; but need to re-extract from voom.tmm$E
+# get the expression values for these marker genes from the voom-norm expr matrix that's had replicates combined above:
+mat.marker.genes <- voom.tmm$E[ match( df.marker.genes$ensmusg_id, rownames(voom.tmm$E) ), ]
+# take unique rows only (as a gene may appear in 2 subtype sigs)
+mat.marker.genes <- unique(mat.marker.genes)
+# drop NAs:
+mat.marker.genes <- mat.marker.genes[!is.na(rownames(mat.marker.genes)),]
+# map mouse symbols to rownames: need to remove NAs first ffs, and also from the f'ing matrix
+new.names <- df.marker.genes$mouse_symbol[ match(rownames(mat.marker.genes), df.marker.genes$ensmusg_id) ]
+mat.marker.genes <- mat.marker.genes[!is.na(new.names),]
+new.names <- new.names[!is.na(new.names)]
+rownames(mat.marker.genes) <- new.names
+# how many left?
+dim(mat.marker.genes)
+
+# plot for on the Wang 2017 subtype marker gene matrix; without and with Sample ID as a label for each point:
+outputname <- paste( output.dir, Sys.Date(), "_GB_GEMMs_MDS_Wang_2017_marker_genes.png", sep="")
+my.mds.plot(mat.marker.genes[ rownames(mat.marker.genes) %in% 
+                                as.character(df.marker.genes$mouse_symbol[grepl(pattern="_2017", x=df.marker.genes$subtype)]), ], 
+            metadata$Sample_ID, metadata$Condition, outputname, 
+            "MDS - voom with TMM norm\nUsing Wang 2017 subtype signatures")
+outputname <- paste( output.dir, Sys.Date(), "_GB_GEMMs_MDS_labelled_Wang_2017_marker_genes.png", sep="")
+my.labelled.mds.plot( mat.marker.genes[ rownames(mat.marker.genes) %in% 
+                                as.character(df.marker.genes$mouse_symbol[grepl(pattern="_2017", x=df.marker.genes$subtype)]), ],
+                     metadata$Sample_ID, metadata$Condition, outputname, 
+                     "MDS - voom with TMM norm\nUsing Wang 2017 subtype signatures", metadata$Sample_ID)
+
+###############
+# NEW NEW NEW 20191129: combine the replicates into single points, replot the Wang 2017 marker gene mat
+###############
+#
+# combine replicates in mat.marker.genes:
+#
+# extract expression matrix, as df to make it ezier
+mat.marker.genes.combined <- as.data.frame(mat.marker.genes)
+# calculate means for replicates
+mat.marker.genes.combined$ctrlNSC <- rowMeans( mat.marker.genes.combined[ , grepl(pattern="ctrlNSC_", x=colnames(mat.marker.genes.combined)) ] )
+mat.marker.genes.combined$tNSC4 <- rowMeans( mat.marker.genes.combined[ , grepl(pattern="tNSC4_", x=colnames(mat.marker.genes.combined)) ] )
+# remove replicates
+mat.marker.genes.combined <- mat.marker.genes.combined[ , !grepl(pattern="_rep", x=colnames(mat.marker.genes.combined)) ]
+
+# generate new vectors of sample IDs + conditions for these plots
+mds.combined.samples <- colnames(mat.marker.genes.combined)
+mds.combined.samples
+#[1] "tNSC1"   "tNSC2"   "tNSC3"   "GBM_1"   "GBM_2"   "GBM_3"   "ctrlNSC"
+#[8] "tNSC4"
+mds.combined.cond <- c( rep("tNSC",3), rep("GBM",3), "ctrlNSC", "tNSC")
+
+# plot for on the Wang 2017 subtype marker gene matrix; without and with Sample ID as a label for each point:
+outputname <- paste( output.dir, Sys.Date(), "_GB_GEMMs_MDS_Wang_2017_marker_genes_combineReps.png", sep="")
+my.mds.plot(mat.marker.genes.combined, 
+            mds.combined.samples, mds.combined.cond, outputname, 
+            "MDS - voom with TMM norm\nUsing Wang 2017 subtype signatures (replicates combined)")
+outputname <- paste( output.dir, Sys.Date(), "_GB_GEMMs_MDS_labelled_Wang_2017_marker_genes_combineReps.png", sep="")
+my.labelled.mds.plot( mat.marker.genes.combined,
+                     mds.combined.samples, mds.combined.cond, outputname, 
+                     "MDS - voom with TMM norm\nUsing Wang 2017 subtype signatures (replicates combined)", 
+                     mds.combined.samples)
+
+###############
+# NEW NEW NEW 20191205: combine the replicates into single points, replot the all genes MDS
+###############
+#
+# combine replicates in voom.tmm$E:
+#
+# extract expression matrix, as df to make it ezier
+mat.genes.combined <- as.data.frame(voom.tmm$E)
+# calculate means for replicates
+mat.genes.combined$ctrlNSC <- rowMeans( mat.genes.combined[ , grepl(pattern="ctrlNSC_", x=colnames(mat.genes.combined)) ] )
+mat.genes.combined$tNSC4 <- rowMeans( mat.genes.combined[ , grepl(pattern="tNSC4_", x=colnames(mat.genes.combined)) ] )
+# remove replicates
+mat.genes.combined <- mat.genes.combined[ , !grepl(pattern="_rep", x=colnames(mat.genes.combined)) ]
+
+# generate new vectors of sample IDs + conditions for these plots
+mds.combined.samples <- colnames(mat.genes.combined)
+mds.combined.samples
+#[1] "tNSC1"   "tNSC2"   "tNSC3"   "GBM_1"   "GBM_2"   "GBM_3"   "ctrlNSC"
+#[8] "tNSC4"
+mds.combined.cond <- c( rep("tNSC",3), rep("GBM",3), "ctrlNSC", "tNSC")
+
+# plot for on the Wang 2017 subtype marker gene matrix; without and with Sample ID as a label for each point:
+outputname <- paste( output.dir, Sys.Date(), "_GB_GEMMs_MDS_all_genes_combineReps.png", sep="")
+my.mds.plot(mat.genes.combined, 
+            mds.combined.samples, mds.combined.cond, outputname, 
+            "MDS - voom with TMM norm\nUsing all genes (replicates combined)")
+outputname <- paste( output.dir, Sys.Date(), "_GB_GEMMs_MDS_labelled_all_genes_combineReps.png", sep="")
+my.labelled.mds.plot( mat.genes.combined,
+                     mds.combined.samples, mds.combined.cond, outputname, 
+                     "MDS - voom with TMM norm\nUsing all genes (replicates combined)", 
+                     mds.combined.samples)
+
+###############
+#
+# new 20201228 - code to visualise an activated NSC signature in the samples
+#
+# load aNSC signature:
+#
+###############
+# read in aNSC signature from .csv:
+sig.nsc <- read.csv("annotation/aNSC_signature_Beckervordersandforth_2015_20201224.csv")
+#
+# take unique gene symbols only:
+sig.nsc <- unique(as.character(sig.nsc$gene_symbol))
+#
+# how many in the signature?
+length(sig.nsc)
+# leaves 243; but not that we have many strange symbols e.g. 1110020C03Rik et al which likely will not be in our RNAseq data
+
+# so how many appear in our Gencode transcriptome ref?
+table(sig.nsc %in% gencode$gene_name)
+#
+#FALSE  TRUE
+#   59   184
+# 
+# so enough to try see what happens, at least.
+
+###############
+#
+# extract the GX data for our samples for these gene symbols
+# as a matrix as we're making heatmaps
+#
+# get GX values from mat.gx.ssgsea (voom/TMM norm GX matrix)
+# rownames = ENSMUSG IDs so match based on mapping symbols to those in the Gencode ref
+#
+###############
+mat.sig.nsc <- mat.gx.ssgsea[ rownames(mat.gx.ssgsea) %in% gencode$gene_id[match(sig.nsc, gencode$gene_name)], ]
+#
+# what we got?
+dim(mat.sig.nsc)
+# 164 rows/genes, 8 cols.
+
+#
+# ENSMUSG IDs are not very useful: so re-add the rownames as gene symbols
+rownames(mat.sig.nsc) <- gencode$gene_name[ match(rownames(mat.sig.nsc), gencode$gene_id) ]
+
+###############
+#
+# plot as heatmap
+#
+###############
+# generate heatmap obj
+p <- Heatmap( as.matrix(mat.sig.nsc), col=c("blue","white","red"), name="log-cpm (voom)", 
+             #width=unit(2, "cm"), 
+             column_names_gp = gpar(fontsize = 5),
+             clustering_method_rows="complete", 
+             clustering_distance_rows=function(x) as.dist(1-cor(t(x))), 
+             row_dend_width = unit(2, "cm"), top_annotation=col.anno,
+             column_title="aNSC signature expression", column_title_gp = gpar(fontsize = 9), 
+             show_row_names=TRUE, row_names_gp=gpar(fontsize=4),
+             cluster_columns=TRUE,
+             clustering_method_columns="complete", 
+             clustering_distance_columns=function(x) as.dist(1-cor(t(x))) )
+pdf(paste0(output.dir, Sys.Date(),"_GB_GEMM_cell_lines_subtyping_GB_signatures_GX_heatmap_aNSC_signature.pdf"), 
+    height=12, width=6)
+p
+dev.off()
+
+# also do z-scores for the rows - so do scale on transverse of matrix, then transverse back to original shape
+mat.sig.nsc.z <- t(scale(t(mat.sig.nsc)))
+# now gen heatmap:
+# colour for z-scores
+cols.z <- colorRamp2( breaks=c( min(mat.sig.nsc.z), 0, max(mat.sig.nsc.z) ), colors=rev(brewer.pal(3, "PuOr")) )
+# generate heatmap obj
+p <- Heatmap( as.matrix(mat.sig.nsc.z), col=cols.z, name="z-scores of\nlog-cpm (voom)", 
+             #width=unit(2, "cm"), 
+             column_names_gp = gpar(fontsize = 5),
+	clustering_method_rows="ward.D2", 
+             clustering_distance_rows=function(x) as.dist(1-cor(t(x))), 
+             row_dend_width = unit(2, "cm"), top_annotation=col.anno,
+	column_title="aNSC signature expression", column_title_gp = gpar(fontsize = 9), 
+             show_row_names=TRUE, row_names_gp=gpar(fontsize=4),
+             cluster_columns=TRUE,
+            clustering_method_columns="ward.D2", 
+             clustering_distance_columns=function(x) as.dist(1-cor(t(x))) )
+pdf(paste0(output.dir, Sys.Date(),"_GB_GEMM_cell_lines_subtyping_GB_signatures_GX_heatmap_aNSC_signature_z-scores.pdf"), 
+    height=12, width=6)
+p
+dev.off()
+
+###############
+#
+# plot as violins/beeeeees as well, i guess:
+#
+###############
+# turn the matrix into a ggplot2-style df with melt from reshape2
+df.plot.sig.nsc <- reshape2::melt(mat.sig.nsc)
+        
+# generate named vector of colours for violins
+sample.colours <- vector(mode="character", length=ncol(mat.sig.nsc))
+names(sample.colours) <- as.character(unique(df.plot.sig.nsc$variable))
+# 3 tNSCs, 3 GBMs, ctrlNSC, tNSC
+sample.colours <- c(rep("cyan",3), rep("#4daf4a",3), "black", "cyan")
+        
+# generate ggplot2 obj
+p <- ggplot(data=df.plot.sig.nsc, aes(x=variable, y=value)) + geom_violin(aes(fill=variable)) +
+    geom_boxplot(width=.1, fill="white", outlier.colour="black") + 
+    scale_fill_manual(values=sample.colours) + 
+    theme_bw() + theme(legend.position="none") + ylab("voom log-cpm") + xlab(NULL) # drop legend, fix axis labels
+pdf(paste0(output.dir, Sys.Date(),"_GB_GEMM_cell_lines_subtyping_GB_signatures_GX_violins_aNSC_signature.pdf"), 
+    height=3, width=6)
+p
+dev.off()
+
+# better as beeswarms innit!
+# add a boxplot in on top
+library(ggbeeswarm)
+p <- ggplot(data=df.plot.sig.nsc, aes(x=variable, y=value)) + geom_beeswarm(aes(colour=variable), size=0.3) +
+    geom_boxplot(width=.2, fill="white", outlier.colour="black") + 
+    scale_colour_manual(values=sample.colours) + 
+    theme_bw() + theme(legend.position="none") + ylab("voom log-cpm") + xlab(NULL) # drop legend, fix axis labels
+pdf(paste0(output.dir, Sys.Date(),"_GB_GEMM_cell_lines_subtyping_GB_signatures_GX_beeswarms_aNSC_signature.pdf"), 
+    height=3, width=6)
+p
+dev.off()
+	 
+################################################
+# save copy of session info / R env
+################################################
+message( "Saving session info and copy of R environ...")
+# session info
+seshinf <- paste ( output.dir, Sys.Date(), "_pipeline_sessionInfo.txt", sep="")
+writeLines(capture.output(sessionInfo()), seshinf)
+
+# Renv
+outputname <- paste( output.dir, Sys.Date(), "_pipeline_end_Renv.Rdata", sep="")
+save.image(file=outputname)
